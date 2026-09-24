@@ -1,8 +1,13 @@
-"""SRT 字幕时间校准工具后端。
+"""SRT 字幕工具后端：时间校准 / 片段剪辑 / 双语合成。
 
-核心逻辑：根据用户给出的若干「原字幕时刻 -> 视频实际时刻」锚点，
+校准：根据用户给出的若干「原字幕时刻 -> 视频实际时刻」锚点，
 按原时刻排序后在相邻锚点间做线性插值，两端按最近一段的斜率外推，
 统一换算每条字幕的起止时间，并检测负时间 / 起止倒置 / 与下一条重叠。
+
+剪辑：按左闭右开保留区间裁剪字幕并拼接到连续时间轴。
+
+双语合成：主轨与译文轨按时间顺序全局配对（每条主轨 0~2 条译文、
+译文至多使用一次、仅正时长交叠可配），导出按主轨时间编号的双语 SRT。
 """
 import re
 from pathlib import Path
@@ -12,7 +17,7 @@ from fastapi import FastAPI, HTTPException
 from fastapi.responses import HTMLResponse, Response
 from pydantic import BaseModel
 
-app = FastAPI(title="SRT 字幕时间校准 / 片段剪辑")
+app = FastAPI(title="SRT 字幕时间校准 / 片段剪辑 / 双语合成")
 
 STATIC_DIR = Path(__file__).parent / "static"
 
@@ -480,4 +485,196 @@ def export(req: CalibrateRequest):
         content=content.encode("utf-8"),
         media_type="application/x-subrip",
         headers={"Content-Disposition": 'attachment; filename="calibrated.srt"'},
+    )
+
+
+# ---------------------------------------------------------------- 双语 SRT 合成
+
+class BilingualRequest(BaseModel):
+    main: str   # 主轨 SRT 文本（决定导出时间与编号）
+    trans: str  # 译文轨 SRT 文本
+
+
+def timed_entries(text: str, label: str) -> List[dict]:
+    """解析一轨 SRT，校验正时长并按时间排序；每条附加 pos（原文件顺序，0 起）。
+
+    空时长（终点 == 起点）或起止倒置（终点 < 起点）均报错。
+    """
+    try:
+        entries = parse_srt(text)
+    except ValueError as e:
+        raise ValueError(f"{label}{e}")
+    for k, e in enumerate(entries, 1):
+        if e["end"] <= e["start"]:
+            raise ValueError(
+                f"{label}第 {k} 块（序号 {e['index']}）时长为空或起止倒置："
+                f"{fmt_time(e['start'])} --> {fmt_time(e['end'])}"
+            )
+    for pos, e in enumerate(entries):
+        e["pos"] = pos
+    entries.sort(key=lambda e: (e["start"], e["end"], e["pos"]))
+    return entries
+
+
+def pair_bilingual(mains: List[dict], trans: List[dict]):
+    """按时间顺序全局配对：每条主轨配 0~2 条译文，每条译文至多使用一次，
+    仅存在正时长交叠的主/译文才可配对；配对保持时间顺序（先出现的主轨
+    配到的译文序号都小于后出现的主轨所配译文）。目标依次：
+      1) 总交叠毫秒数最大；
+      2) 漏配译文最少（已配译文条数最多）；
+      3) 已配译文的原序号序列字典序最小（等价于让译文使用位图尽量靠前置位，
+         即用位值 bit[j] = 1 << (n-1-j) 表示译文 j 被使用，位值总和最大者胜）。
+    返回 (pairs, best)：pairs 为 [(主轨下标, (译文下标, ...))]，best 为目标键。
+
+    实现：只在「译文 j 与主轨 i 正交叠」的决策点分支，强制步骤（丢弃对当前
+    及后续主轨均无交叠的译文、收尾与当前及后续译文均无交叠的主轨）直接快进，
+    状态数与交叠对数同阶；所有边都使 i+j 严格增大，构成 DAG。
+    """
+    m, n = len(mains), len(trans)
+    MS = [e["start"] for e in mains]
+    ME = [e["end"] for e in mains]
+    TS = [e["start"] for e in trans]
+    TE = [e["end"] for e in trans]
+    bit = [1 << (n - 1 - j) for j in range(n)]
+
+    def ff(i: int, j: int, k: int):
+        """快进强制步骤，返回下一个决策点（或 i==m / j==n 的终点）。"""
+        while i < m and j < n:
+            if TE[j] <= MS[i]:      # 译文 j 对当前及后续主轨都无交叠：丢弃
+                j += 1
+            elif TS[j] >= ME[i]:    # 当前及后续译文都与主轨 i 无交叠：主轨 i 收尾
+                i += 1
+                k = 0
+            else:
+                break
+        return i, j, k
+
+    def moves(i: int, j: int, k: int):
+        """决策点 (i, j, k)：译文 j 与主轨 i 正交叠，主轨 i 已配 k 条。
+        产出 (交叠增益, 用译文数, 位值增益, ni, nj, nk, 本步配出的译文或 None)。"""
+        if i >= m or j >= n:
+            return
+        if k < 2:  # 主轨 i 配译文 j
+            w = min(ME[i], TE[j]) - max(MS[i], TS[j])
+            yield (w, 1, bit[j], *ff(i + (k == 1), j + 1, 0 if k == 1 else 1), j)
+        yield (0, 0, 0, *ff(i, j + 1, k), None)      # 译文 j 留作未配
+        yield (0, 0, 0, *ff(i + 1, j, 0), None)      # 主轨 i 收尾，译文 j 留给后续主轨
+
+    # 收集可达状态
+    MAX_STATES = 200_000
+    start = ff(0, 0, 0)
+    states = {start}
+    stack = [start]
+    while stack:
+        for *_g, ni, nj, nk, _u in moves(*stack.pop()):
+            t = (ni, nj, nk)
+            if t not in states:
+                states.add(t)
+                stack.append(t)
+        if len(states) > MAX_STATES:
+            raise ValueError("配对状态规模过大，请检查两轨是否存在大量互相覆盖的超长字幕")
+
+    # 自后向前松弛：suff[s] = 从 s 到终点的最优目标键 (总交叠, 已配译文数, 位值)
+    suff = {}
+    for s in sorted(states, key=lambda p: p[0] + p[1], reverse=True):
+        best = None
+        for g0, g1, g2, ni, nj, nk, _u in moves(*s):
+            t = suff[(ni, nj, nk)]
+            key = (g0 + t[0], g1 + t[1], g2 | t[2])
+            if best is None or key > best:
+                best = key
+        suff[s] = best if best is not None else (0, 0, 0)
+
+    # 自前向后还原：任取达到最优键的转移即可（位值唯一决定已配译文集合）
+    pairs = []
+    i, j, k = start
+    cur: List[int] = []
+    while i < m and j < n:
+        for g0, g1, g2, ni, nj, nk, used in moves(i, j, k):
+            t = suff[(ni, nj, nk)]
+            if (g0 + t[0], g1 + t[1], g2 | t[2]) == suff[(i, j, k)]:
+                if used is not None:
+                    cur.append(used)
+                if ni != i:  # 主轨 i 收尾
+                    if cur:
+                        pairs.append((i, tuple(cur)))
+                    cur = []
+                i, j, k = ni, nj, nk
+                break
+    if cur:  # 译文耗尽时主轨 i 可能刚配到 1 条，一并收尾
+        pairs.append((i, tuple(cur)))
+    return pairs, suff[start]
+
+
+def _bilingual_prepare(req: "BilingualRequest"):
+    """双语合成公共预处理，成功返回 (mains, trans, plan)，失败抛 400。
+
+    plan 为按主轨时间顺序的 [(主轨下标, (译文下标, ...))]，覆盖全部主轨
+    （未配到译文的主轨对应空元组）。
+    """
+    try:
+        mains = timed_entries(req.main, "主轨：")
+        trans = timed_entries(req.trans, "译文轨：")
+        pairs, _best = pair_bilingual(mains, trans)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    by_main = {i: used for i, used in pairs}
+    plan = [(i, by_main.get(i, ())) for i in range(len(mains))]
+    return mains, trans, plan
+
+
+def _entry_payload(e: dict) -> dict:
+    return {
+        "index": e["index"],
+        "time": f"{fmt_time(e['start'])} --> {fmt_time(e['end'])}",
+        "text": "\n".join(e["lines"]),
+    }
+
+
+@app.post("/api/bilingual/preview")
+def bilingual_preview(req: BilingualRequest):
+    mains, trans, plan = _bilingual_prepare(req)
+    used_set = {j for _i, used in plan for j in used}
+    entries = []
+    for i, used in plan:
+        e = mains[i]
+        translations = []
+        for j in used:
+            t = trans[j]
+            ov = min(e["end"], t["end"]) - max(e["start"], t["start"])
+            translations.append({**_entry_payload(t), "overlap": ov})
+        entries.append({**_entry_payload(e), "translations": translations})
+    return {
+        "main_count": len(mains),
+        "trans_count": len(trans),
+        "paired_trans_count": len(used_set),
+        "unpaired_trans_count": len(trans) - len(used_set),
+        "total_overlap": sum(
+            min(mains[i]["end"], trans[j]["end"]) - max(mains[i]["start"], trans[j]["start"])
+            for i, used in plan for j in used
+        ),
+        "entries": entries,
+        "unpaired": [
+            _entry_payload(t) for j, t in enumerate(trans) if j not in used_set
+        ],
+    }
+
+
+@app.post("/api/bilingual/export")
+def bilingual_export(req: BilingualRequest):
+    mains, trans, plan = _bilingual_prepare(req)
+    blocks = []
+    for num, (i, used) in enumerate(plan, 1):
+        e = mains[i]
+        lines = list(e["lines"])
+        for j in used:
+            lines.extend(trans[j]["lines"])
+        blocks.append(
+            f"{num}\n{fmt_time(e['start'])} --> {fmt_time(e['end'])}\n" + "\n".join(lines)
+        )
+    content = "\n\n".join(blocks) + "\n"
+    return Response(
+        content=content.encode("utf-8"),
+        media_type="application/x-subrip",
+        headers={"Content-Disposition": 'attachment; filename="bilingual.srt"'},
     )

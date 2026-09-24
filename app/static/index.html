@@ -50,6 +50,11 @@
   .interval-row { display: flex; gap: 8px; align-items: center; margin-bottom: 8px; flex-wrap: wrap; }
   .interval-row .row-no { color: #6b7280; font-size: 12px; width: 3.2em;
            font-family: ui-monospace, Consolas, monospace; }
+  .bi-trans { border-left: 3px solid #93c5fd; background: #eff6ff; border-radius: 4px;
+           padding: 4px 8px; margin: 4px 0; }
+  tr.no-trans { background: #fffbeb; }
+  .overlap-tag { display: inline-block; background: #dbeafe; color: #1d4ed8; border-radius: 4px;
+           padding: 1px 6px; font-size: 12px; margin-left: 4px; }
 </style>
 </head>
 <body>
@@ -104,6 +109,37 @@
   </div>
   <div id="clipMessage"></div>
   <div id="clipResult"></div>
+</div>
+
+<hr class="feature-divider">
+<h1 id="bilingual">双语 SRT 合成</h1>
+<p class="hint">分别粘贴或上传<strong>主轨</strong>与<strong>译文轨</strong>两份 SRT，按时间顺序全局配对：
+每条主轨可配 0～2 条译文，每条译文至多使用一次，仅有正时长交叠的主/译文才可配对。
+配对优先最大化总交叠毫秒数；并列时依次优先「漏配译文更少」、「已配译文原序号序列字典序更小」。
+导出按主轨时间与顺序重新编号，两轨正文分行写入同一字幕块，主轨无译文仍保留；
+两轨中时长为空或起止倒置的字幕会报错。</p>
+
+<div class="card">
+  <h2>6. 主轨 SRT（决定导出的时间与编号）</h2>
+  <input type="file" id="biMainFile" accept=".srt,.txt">
+  <textarea id="biMain" placeholder="1&#10;00:00:01,000 --> 00:00:03,000&#10;第一句主轨字幕&#10;&#10;2&#10;00:00:04,000 --> 00:00:06,000&#10;第二句主轨字幕"></textarea>
+</div>
+
+<div class="card">
+  <h2>7. 译文轨 SRT</h2>
+  <input type="file" id="biTransFile" accept=".srt,.txt">
+  <textarea id="biTrans" placeholder="1&#10;00:00:01,200 --> 00:00:03,100&#10;First translated line&#10;&#10;2&#10;00:00:04,100 --> 00:00:06,100&#10;Second translated line"></textarea>
+</div>
+
+<div class="card">
+  <h2>8. 预览配对与导出双语 SRT</h2>
+  <div class="toolbar">
+    <button onclick="biPreview()">预览配对结果</button>
+    <button id="biExportBtn" onclick="biExport()" disabled>导出双语 SRT</button>
+    <span class="hint" id="biExportHint">请先预览配对结果</span>
+  </div>
+  <div id="biMessage"></div>
+  <div id="biResult"></div>
 </div>
 
 <script>
@@ -391,6 +427,101 @@ async function clipExport() {
   const a = document.createElement("a");
   a.href = URL.createObjectURL(blob);
   a.download = "clipped.srt";
+  a.click();
+  URL.revokeObjectURL(a.href);
+}
+
+// ------------------------------------------------------------ 双语 SRT 合成
+
+function hookFile(inputId, targetId) {
+  $(inputId).addEventListener("change", e => {
+    const f = e.target.files[0];
+    if (!f) return;
+    const r = new FileReader();
+    r.onload = () => { $(targetId).value = r.result; };
+    r.readAsText(f);
+  });
+}
+hookFile("biMainFile", "biMain");
+hookFile("biTransFile", "biTrans");
+
+function biPayload() {
+  return JSON.stringify({ main: $("biMain").value, trans: $("biTrans").value });
+}
+
+function showBiError(msg) {
+  $("biMessage").innerHTML = `<div class="error">⚠ ${escapeHtml(msg)}</div>`;
+  $("biResult").innerHTML = "";
+  $("biExportBtn").disabled = true;
+}
+
+function renderBiPreview(pv) {
+  const rows = pv.entries.map((e, k) => {
+    const transHtml = e.translations.length
+      ? e.translations.map(t =>
+          `<div class="bi-trans"><strong>#${escapeHtml(t.index)}</strong> ` +
+          `<span class="mono">${escapeHtml(t.time)}</span>` +
+          `<span class="overlap-tag">交叠 ${t.overlap} ms</span><br>` +
+          `<span class="mono">${escapeHtml(t.text)}</span></div>`
+        ).join("")
+      : `<span class="hint">（无配对译文，导出时仅保留主轨正文）</span>`;
+    return `
+    <tr class="${e.translations.length ? "" : "no-trans"}">
+      <td>${k + 1}</td>
+      <td>${escapeHtml(e.index)}</td>
+      <td class="mono">${escapeHtml(e.time)}</td>
+      <td class="mono">${escapeHtml(e.text)}</td>
+      <td>${transHtml}</td>
+    </tr>`;
+  }).join("");
+  let html = `<table>
+    <tr><th>导出序号</th><th>主轨原序号</th><th>主轨时间</th><th>主轨正文</th><th>配对译文（0～2 条）</th></tr>${rows}</table>`;
+  if (pv.unpaired.length) {
+    const unpairedRows = pv.unpaired.map(t => `
+    <tr>
+      <td>${escapeHtml(t.index)}</td>
+      <td class="mono">${escapeHtml(t.time)}</td>
+      <td class="mono">${escapeHtml(t.text)}</td>
+    </tr>`).join("");
+    html += `<h2 style="margin-top:16px">未配译文（${pv.unpaired.length} 条，不写入导出文件）</h2>
+    <table><tr><th>译文原序号</th><th>时间</th><th>正文</th></tr>${unpairedRows}</table>`;
+  }
+  $("biResult").innerHTML = html;
+  $("biMessage").innerHTML =
+    `<div class="ok-banner">✓ 主轨 ${pv.main_count} 条、译文轨 ${pv.trans_count} 条；` +
+    `已配译文 ${pv.paired_trans_count} 条，未配译文 ${pv.unpaired_trans_count} 条；` +
+    `总交叠 ${pv.total_overlap} ms。可以导出。</div>`;
+  $("biExportBtn").disabled = false;
+}
+
+async function biPreview() {
+  $("biMessage").innerHTML = "";
+  let res;
+  try {
+    res = await fetch("/api/bilingual/preview", {
+      method: "POST", headers: { "Content-Type": "application/json" }, body: biPayload(),
+    });
+  } catch (e) { return showBiError("网络错误：" + e); }
+  const data = await res.json();
+  if (res.ok) return renderBiPreview(data);
+  return showBiError((data && typeof data.detail === "string") ? data.detail : "请求失败");
+}
+
+async function biExport() {
+  let res;
+  try {
+    res = await fetch("/api/bilingual/export", {
+      method: "POST", headers: { "Content-Type": "application/json" }, body: biPayload(),
+    });
+  } catch (e) { return showBiError("网络错误：" + e); }
+  if (!res.ok) {
+    const data = await res.json();
+    return showBiError((data && typeof data.detail === "string") ? data.detail : "导出被拒绝");
+  }
+  const blob = await res.blob();
+  const a = document.createElement("a");
+  a.href = URL.createObjectURL(blob);
+  a.download = "bilingual.srt";
   a.click();
   URL.revokeObjectURL(a.href);
 }

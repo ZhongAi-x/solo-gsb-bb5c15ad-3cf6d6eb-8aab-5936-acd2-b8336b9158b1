@@ -12,7 +12,7 @@ from fastapi import FastAPI, HTTPException
 from fastapi.responses import HTMLResponse, Response
 from pydantic import BaseModel
 
-app = FastAPI(title="SRT 字幕时间校准 / 片段剪辑")
+app = FastAPI(title="SRT 字幕时间校准 / 片段剪辑 / 双语合成")
 
 STATIC_DIR = Path(__file__).parent / "static"
 
@@ -458,6 +458,398 @@ def clip_export(req: ClipRequest):
         content=content.encode("utf-8"),
         media_type="application/x-subrip",
         headers={"Content-Disposition": 'attachment; filename="clipped.srt"'},
+    )
+
+
+# ---------------------------------------------------------------- 双语合成
+
+class MergeRequest(BaseModel):
+    main: str         # 主轨 SRT
+    translation: str  # 译文轨 SRT
+
+
+MAX_MERGE_EDGES = 2_000_000  # 正时长交叠候选对上限（含残差边开销）
+
+
+def _overlap_ms(a: dict, b: dict) -> int:
+    """两条字幕的正时长交叠毫秒数；端点相触 / 不交叠返回 0。"""
+    lo, hi = max(a["start"], b["start"]), min(a["end"], b["end"])
+    return hi - lo if hi > lo else 0
+
+
+def _validate_track_duration(entries: List[dict], track: str) -> None:
+    """任一轨出现空时长（end == start）或起止倒置（end < start）即报错。"""
+    for i, e in enumerate(entries, 1):
+        if e["end"] <= e["start"]:
+            kind = "空时长" if e["end"] == e["start"] else "起止时间倒置"
+            raise ValueError(
+                f"{track}第 {i} 条字幕{kind}："
+                f"{fmt_time(e['start'])} --> {fmt_time(e['end'])}"
+            )
+
+
+def _track_is_ordered(entries: List[dict]) -> bool:
+    """轨内条目是否按 (start, end) 均非降排列；正常 SRT 时间轴均满足。"""
+    return all(
+        entries[i]["start"] <= entries[i + 1]["start"]
+        and entries[i]["end"] <= entries[i + 1]["end"]
+        for i in range(len(entries) - 1)
+    )
+
+
+def _weight_params(m: int, n: int):
+    """三级目标的整数权重参数（详见 pair_entries 文档）。
+
+    每条译文在任一可行配对中至多使用一次（容量 1），故「已用译文序号集合」
+    可用无进位的二进制位掩码表示：译文 j（0 起）贡献 2**(n-1-j)，最小序号
+    为最高位。等大小集合的升序序号序列字典序越小，该掩码越大；掩码总和
+    < 2**n。配对固定奖励取 2**n，2m 份之和仍小于一个交叠毫秒位，从而：
+    交叠毫秒数 > 已配数（少漏配）> 序号序列字典序。
+    """
+    seq_bit = [1 << (n - 1 - j) for j in range(n)]
+    shift_seq = n
+    match_bonus = 1 << shift_seq
+    shift_cnt = shift_seq + (2 * m).bit_length() + 1
+    return seq_bit, match_bonus, shift_cnt
+
+
+def _pair_ordered_dp(mains: List[dict], trans: List[dict]):
+    """两轨均 (start,end) 非降时的保序最优配对（带状窗口，典型近线性）。
+
+    f[i][j][k]：第 i 条主轨已配 k∈{0,1,2} 条译文、译文已消费到第 j 条时
+    的最优权重。k==0 可跳过译文 j 或闭合当前主轨；k>0 可跳过译文或把译文 j
+    配给当前主轨（仅正时长交叠）。两轨有序时交叠矩阵为 Monge 型，保序最优
+    即全局最优。
+
+    有序轨上每条主轨的正交叠译文下标是连续区间，且其左/右端点随主轨单调，
+    故每行只需在 [L_i, R_i] 窗口内计算状态；轨内互不重叠（正常 SRT）时
+    每个译文窗口只被常数个主轨覆盖，总状态 O(m+n)。轨内可有序重叠时窗口变
+    宽，最差退化到 O(m*n)，仍正确。
+    """
+    import bisect
+
+    m, n = len(mains), len(trans)
+    seq_bit, bonus, shift_cnt = _weight_params(m, n)
+    t_starts = [e["start"] for e in trans]
+    t_ends = [e["end"] for e in trans]
+
+    # 主轨 i 的正交叠译文下标区间 first_i .. last_i（TE、TS 均非降）
+    first, last = [], []
+    for me in mains:
+        a = bisect.bisect_right(t_ends, me["start"])      # 第一个 end_j > start_i
+        b = bisect.bisect_left(t_starts, me["end"]) - 1  # 最后一个 start_j < end_i
+        first.append(min(a, n))
+        last.append(b)  # first_i <= last_i 时才存在交叠译文
+
+    # 每行窗口 [L_i, R_i]：左端承接下一主轨首个可能译文，右端覆盖到下一主轨左端
+    left = [0] * (m + 1)
+    right = [0] * (m + 1)
+    for i in range(m):
+        if i >= 1:
+            left[i] = first[i]
+        r = last[i] + 1  # 本行最后交叠译文的下一列（关闭/跳过传播所需）
+        if i + 1 < m:
+            r = max(r, first[i + 1])
+        right[i] = min(r, n)
+    left[m] = first[m - 1] if m else 0
+    right[m] = n
+    for i in range(1, m + 1):  # 窗口左端随主轨单调不减，钳制抖动
+        if left[i] < left[i - 1]:
+            left[i] = left[i - 1]
+    for i in range(m + 1):
+        if right[i] < left[i]:
+            right[i] = left[i]
+
+    neg = -(1 << 230)
+    TAG_SKIP, TAG_MATCH, TAG_ROOT = 0, 1, 254
+    TAG_CLOSE0, TAG_INVALID = 2, 255
+    tags = {}
+
+    def gix(i, j, k):
+        return (i * (n + 1) + j) * 3 + k
+
+    prev = None          # 上一行窗口内的状态 dict: (j,k) -> value
+    p_lo = p_hi = 0
+    for i in range(m + 1):
+        lo, hi = left[i], right[i]
+        cur = {}
+        si = mains[i]["start"] if i < m else 0
+        ei = mains[i]["end"] if i < m else 0
+
+        def pget(j, k):
+            if prev is None:
+                return 0 if (j == 0 and k == 0) else neg
+            if p_lo <= j <= p_hi:
+                return prev.get((j, k), neg)
+            return neg
+
+        # 窗口首列 k=0：由上一行闭合而来（i==0 且 lo==0 为起点）
+        if prev is None and lo == 0:
+            cur[(lo, 0)] = 0
+            tags[gix(i, lo, 0)] = TAG_ROOT
+        else:
+            best_v, best_k = neg, 0
+            for kp in range(3):
+                v = pget(lo, kp)
+                if v > best_v:
+                    best_v, best_k = v, kp
+            cur[(lo, 0)] = best_v
+            tags[gix(i, lo, 0)] = TAG_CLOSE0 + best_k
+        cur.setdefault((lo, 1), neg)
+        cur.setdefault((lo, 2), neg)
+
+        for j in range(lo + 1, hi + 1):
+            # k == 0：左邻跳过译文，或上一行在列 j 闭合当前主轨
+            best, tag = cur.get((j - 1, 0), neg), TAG_SKIP
+            for kp in range(3):
+                v = pget(j, kp)
+                if v > best:
+                    best, tag = v, TAG_CLOSE0 + kp
+            cur[(j, 0)] = best
+            tags[gix(i, j, 0)] = TAG_INVALID if best == neg else tag
+
+            wc = None
+            if i < m:
+                ts, te = t_starts[j - 1], t_ends[j - 1]
+                xlo = si if si > ts else ts
+                xhi = ei if ei < te else te
+                if xhi > xlo:
+                    wc = ((xhi - xlo) << shift_cnt) + bonus + seq_bit[j - 1]
+            for k in (1, 2):
+                best, tag = cur.get((j - 1, k), neg), TAG_SKIP
+                pv = cur.get((j - 1, k - 1), neg)
+                if wc is not None and pv > neg:
+                    cand = pv + wc
+                    if cand > best:
+                        best, tag = cand, TAG_MATCH
+                cur[(j, k)] = best
+                tags[gix(i, j, k)] = TAG_INVALID if best == neg else tag
+        prev, p_lo, p_hi = cur, lo, hi
+
+    assignments = [[] for _ in range(m)]
+    i, j, k = m, n, 0
+    while i > 0 or j > 0 or k > 0:
+        tag = tags.get(gix(i, j, k), TAG_INVALID)
+        if k == 0:
+            if tag == TAG_SKIP:
+                j -= 1
+            elif TAG_CLOSE0 <= tag <= TAG_CLOSE0 + 2:
+                i -= 1
+                k = tag - TAG_CLOSE0
+            else:
+                raise ValueError("配对回溯失败（内部错误）")
+        elif tag == TAG_MATCH:
+            assignments[i].append(j - 1)
+            j -= 1
+            k -= 1
+        elif tag == TAG_SKIP:
+            j -= 1
+        else:
+            raise ValueError("配对回溯失败（内部错误）")
+    for lst in assignments:
+        lst.sort()
+    return assignments, {t for lst in assignments for t in lst}
+
+
+def _pair_mincostflow(mains: List[dict], trans: List[dict]):
+    """轨内时间回缩（不有序）时的回退算法：最小费用流求全局最优 b-匹配。
+
+    源 -> 主轨容量 2、主轨 -> 译文容量 1（仅正时长交叠候选，费用为 -权重）、
+    译文 -> 汇容量 1；势函数 + Dijkstra 逐次最短路，增广净增益 <= 0 时停止，
+    故不强制配满。对任意（含交叉）配对均全局最优。
+    """
+    import heapq
+
+    m, n = len(mains), len(trans)
+    src, sink, nnode = 0, m + n + 1, m + n + 2
+    graph = [[] for _ in range(nnode)]
+    edge_u, edge_v, cap, edge_cost = [], [], [], []
+
+    def add_edge(u, v, c, w):
+        eid = len(edge_u)
+        edge_u.extend((u, v)); edge_v.extend((v, u))
+        cap.extend((c, 0)); edge_cost.extend((w, -w))
+        graph[u].append(eid)
+        graph[v].append(eid + 1)
+        return eid
+
+    for i in range(m):
+        add_edge(src, 1 + i, 2, 0)
+    for j in range(n):
+        add_edge(1 + m + j, sink, 1, 0)
+
+    seq_bit, bonus, shift_cnt = _weight_params(m, n)
+    pair_edges = {}
+    edge_count = m + n
+    for i, me in enumerate(mains):
+        for j, te in enumerate(trans):
+            ov = _overlap_ms(me, te)
+            if ov <= 0:
+                continue
+            edge_count += 1
+            if edge_count > MAX_MERGE_EDGES:
+                raise ValueError(
+                    f"两轨正时长交叠候选对过多（已超过 {MAX_MERGE_EDGES}），"
+                    "超出配对计算上限，请确认两轨为同一片源后裁短再试"
+                )
+            weight = (ov << shift_cnt) + bonus + seq_bit[j]
+            eid = add_edge(1 + i, 1 + m + j, 1, -weight)
+            pair_edges[eid] = (i, j)
+
+    # 初始势函数：初始正向图是 DAG，按节点编号松弛一遍即得自源点最短距
+    dist = [None] * nnode
+    dist[src] = 0
+    for u in range(nnode):
+        if dist[u] is None:
+            continue
+        for eid in graph[u]:
+            if cap[eid] and (dist[edge_v[eid]] is None
+                             or dist[u] + edge_cost[eid] < dist[edge_v[eid]]):
+                dist[edge_v[eid]] = dist[u] + edge_cost[eid]
+    potential = [0 if d is None else d for d in dist]
+
+    while True:
+        dist = [None] * nnode
+        prev_edge = [-1] * nnode
+        dist[src] = 0
+        heap = [(0, src)]
+        while heap:
+            d, u = heapq.heappop(heap)
+            if d != dist[u]:
+                continue
+            for eid in graph[u]:
+                if cap[eid] <= 0:
+                    continue
+                v = edge_v[eid]
+                nd = d + edge_cost[eid] + potential[u] - potential[v]
+                if dist[v] is None or nd < dist[v]:
+                    dist[v] = nd
+                    prev_edge[v] = eid
+                    heapq.heappush(heap, (nd, v))
+        if dist[sink] is None:
+            break
+        for u in range(nnode):
+            if dist[u] is not None:
+                potential[u] += dist[u]
+        if -potential[sink] <= 0:  # 再增广一条不改善任何一级目标
+            break
+        v = sink
+        while v != src:
+            eid = prev_edge[v]
+            cap[eid] -= 1
+            cap[eid ^ 1] += 1
+            v = edge_u[eid]
+
+    assignments = [[] for _ in range(m)]
+    matched = set()
+    for eid, (i, j) in pair_edges.items():
+        if cap[eid] == 0:
+            assignments[i].append(j)
+            matched.add(j)
+    for lst in assignments:
+        lst.sort()
+    return assignments, matched
+
+
+def pair_entries(mains: List[dict], trans: List[dict]):
+    """全局最优配对（不要求轨内条目互不重叠）。
+
+    每条主轨可配 0~2 条译文、每条译文至多使用一次，仅正时长交叠可配对。
+    三级目标依次为：最大化总交叠毫秒数；并列时最大化已配译文数（少漏配）；
+    再并列时使已用译文原序号（升序）序列字典序最小。
+
+    三级目标编码为单个整数边权（见 _weight_params）：
+        交叠毫秒数 << shift_cnt | 每条配对固定奖励 | 译文序号加权奖励。
+
+    - 两轨均按 (start, end) 非降时（正常 SRT 时间轴），交叠矩阵为 Monge 型，
+      保序网格 DP 即全局最优，走 O(m*n) 的 _pair_ordered_dp；
+    - 轨内时间回缩（条目相互包含 / 错位）时回退到最小费用流
+      _pair_mincostflow，对含交叉的配对仍保证全局最优。
+
+    返回 (assignments, matched_set)：assignments[i] 为配给第 i 条主轨的
+    译文下标（升序）。
+    """
+    if _track_is_ordered(mains) and _track_is_ordered(trans):
+        return _pair_ordered_dp(mains, trans)
+    return _pair_mincostflow(mains, trans)
+
+
+def _merge_prepare(req: "MergeRequest"):
+    """双语合成公共预处理：解析两轨并校验空时长 / 倒置，失败抛 400。"""
+    try:
+        mains = parse_srt(req.main)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=f"主轨解析失败：{e}")
+    try:
+        trans = parse_srt(req.translation)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=f"译文轨解析失败：{e}")
+    try:
+        _validate_track_duration(mains, "主轨")
+        _validate_track_duration(trans, "译文轨")
+        assignments, matched = pair_entries(mains, trans)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    return mains, trans, assignments, matched
+
+
+def _entry_brief(seq: int, e: dict):
+    return {
+        "seq": seq,
+        "index": e["index"],
+        "time": f"{fmt_time(e['start'])} --> {fmt_time(e['end'])}",
+        "text": "\n".join(e["lines"]),
+    }
+
+
+@app.post("/api/merge/preview")
+def merge_preview(req: MergeRequest):
+    mains, trans, assignments, matched = _merge_prepare(req)
+    total_overlap = 0
+    entries = []
+    for i, me in enumerate(mains):
+        paired = []
+        for jt in assignments[i]:
+            ov = _overlap_ms(me, trans[jt])
+            total_overlap += ov
+            brief = _entry_brief(jt + 1, trans[jt])
+            brief["overlap_ms"] = ov
+            paired.append(brief)
+        item = _entry_brief(i + 1, me)
+        item["translations"] = paired
+        entries.append(item)
+    unmatched = [_entry_brief(j + 1, trans[j]) for j in range(len(trans)) if j not in matched]
+    return {
+        "main_count": len(mains),
+        "trans_count": len(trans),
+        "matched_count": len(matched),
+        "unmatched_count": len(trans) - len(matched),
+        "total_overlap_ms": total_overlap,
+        "total_overlap": fmt_time(total_overlap),
+        "entries": entries,
+        "unmatched": unmatched,
+    }
+
+
+@app.post("/api/merge/export")
+def merge_export(req: MergeRequest):
+    mains, trans, assignments, _matched = _merge_prepare(req)
+    blocks = []
+    for i, me in enumerate(mains):
+        body = list(me["lines"])
+        for jt in assignments[i]:
+            body.extend(trans[jt]["lines"])
+        if not body:  # 两轨正文均空时仍保留该主轨块
+            body = [""]
+        blocks.append(
+            f"{i + 1}\n{fmt_time(me['start'])} --> {fmt_time(me['end'])}\n"
+            + "\n".join(body)
+        )
+    content = "\n\n".join(blocks) + "\n"
+    return Response(
+        content=content.encode("utf-8"),
+        media_type="application/x-subrip",
+        headers={"Content-Disposition": 'attachment; filename="bilingual.srt"'},
     )
 
 
